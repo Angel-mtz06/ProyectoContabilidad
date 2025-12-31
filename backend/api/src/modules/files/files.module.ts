@@ -8,5 +8,6 @@ import { ConfigModule } from '@nestjs/config';
   imports: [ConfigModule], 
   controllers: [FilesController],
   providers: [FilesService, OpenAIService], 
+  exports: [FilesService], 
 })
 export class FilesModule {}

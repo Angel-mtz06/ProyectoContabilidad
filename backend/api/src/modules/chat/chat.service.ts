@@ -1,97 +1,107 @@
-import { 
-  Injectable, 
-  ServiceUnavailableException, 
-  InternalServerErrorException,
-  ForbiddenException, // Para el bloqueo de pago
-  UnauthorizedException // Para cuando no encuentra al usuario
-} from '@nestjs/common';
-import { PrismaService } from '../../prisma/prisma.service';
-import { OpenAIService } from '../../common/openai/openai.service';
-import { Role } from '@prisma/client';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import OpenAI from 'openai';
+import * as fs from 'fs';
+import * as path from 'path';
 
 @Injectable()
 export class ChatService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly openAI: OpenAIService,
-  ) {}
+  private openai: OpenAI;
+  private assistantId: string;
 
-  async ask(userId: string, message: string): Promise<string> {
+  constructor() {
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+    this.assistantId = process.env.OPENAI_ASSISTANT_ID || '';
+  }
+
+  async uploadKnowledgeFile(fileBuffer: Buffer, fileName: string) {
     try {
-      // 1. Obtener datos del usuario (Plan y Conteo)
-      const user = await this.prisma.user.findUnique({
-        where: { id: userId },
+      const tempPath = path.join(__dirname, `temp-${Date.now()}-${fileName}`);
+      fs.writeFileSync(tempPath, fileBuffer);
+
+      const file = await this.openai.files.create({
+        file: fs.createReadStream(tempPath),
+        purpose: 'assistants',
       });
 
-      // ✅ CORRECCIÓN: Validamos que el usuario exista antes de leer sus datos
-      if (!user) {
-        throw new UnauthorizedException('Usuario no encontrado');
+      fs.unlinkSync(tempPath);
+
+      const myAssistant = await this.openai.beta.assistants.retrieve(this.assistantId);
+      const openaiAny = this.openai as any;
+      
+      let vectorStoreModule;
+      if (openaiAny.vectorStores) {
+          vectorStoreModule = openaiAny.vectorStores;
+      } else if (openaiAny.beta && openaiAny.beta.vectorStores) {
+          vectorStoreModule = openaiAny.beta.vectorStores;
+      } else {
+          throw new Error('OpenAI version not supported');
       }
 
-      // 🛑 VALIDACIÓN DE PAGO (Lógica Freemium)
-      const MAX_FREE_MESSAGES = 3;
+      // @ts-ignore
+      let vectorStoreId = myAssistant.tool_resources?.file_search?.vector_store_ids?.[0];
 
-      if (user.plan === 'FREE' && user.messageCount >= MAX_FREE_MESSAGES) {
-        throw new ForbiddenException(
-          'Has alcanzado tu límite gratuito (3 mensajes). Actualiza a Premium para continuar.'
-        );
-      }
-
-      // 2. Buscar o crear chat
-      let chat = await this.prisma.chat.findUnique({
-        where: { userId },
-      });
-
-      if (!chat) {
-        chat = await this.prisma.chat.create({
-          data: { userId },
+      if (!vectorStoreId) {
+        const vectorStore = await vectorStoreModule.create({
+          name: 'Biblioteca Fiscal Contable',
+        });
+        vectorStoreId = vectorStore.id;
+        
+        await this.openai.beta.assistants.update(this.assistantId, {
+          tools: [{ type: 'file_search' }],
+          tool_resources: {
+            // @ts-ignore
+            file_search: { vector_store_ids: [vectorStoreId] }
+          }
         });
       }
 
-      // 3. Guardar mensaje del usuario
-      await this.prisma.message.create({
-        data: {
-          chatId: chat.id,
-          role: Role.user,
-          content: message,
-        },
+      await vectorStoreModule.files.create(vectorStoreId, {
+        file_id: file.id
       });
 
-      // 4. Llamar a OpenAI
-      const aiResponse = await this.openAI.chat(message);
+      return { status: 'success', fileId: file.id };
 
-      // 5. Guardar respuesta de la IA
-      await this.prisma.message.create({
-        data: {
-          chatId: chat.id,
-          role: Role.assistant,
-          content: aiResponse,
-        },
+    } catch (error) {
+      throw new InternalServerErrorException('Error uploading knowledge: ' + error.message);
+    }
+  }
+
+  async chat(content: string): Promise<string> {
+    try {
+      if (!this.assistantId) throw new Error('Missing Assistant ID');
+
+      const thread = await this.openai.beta.threads.create();
+      
+      await this.openai.beta.threads.messages.create(thread.id, {
+        role: 'user',
+        content: content,
       });
 
-      // ➕ INCREMENTAR CONTADOR (Solo si es Free)
-      if (user.plan === 'FREE') {
-        await this.prisma.user.update({
-          where: { id: userId },
-          data: { messageCount: user.messageCount + 1 },
-        });
+      // @ts-ignore
+      const run = await this.openai.beta.threads.runs.createAndPoll(thread.id, {
+        assistant_id: this.assistantId,
+      });
+
+      if (run.status !== 'completed') {
+         // @ts-ignore
+         throw new Error(`Run incomplete. Status: ${run.status}`);
       }
 
-      return aiResponse;
+      const messages = await this.openai.beta.threads.messages.list(thread.id);
+      const lastMessage = messages.data[0];
 
-    } catch (error: any) {
-      // Si el error es de negocio (Pago o Auth), lo dejamos pasar al usuario
-      if (error instanceof ForbiddenException || error instanceof UnauthorizedException) {
-        throw error;
+      if (lastMessage.role === 'assistant' && lastMessage.content[0].type === 'text') {
+        let text = lastMessage.content[0].text.value;
+        text = text.replace(/【.*?】/g, ''); 
+        return text;
       }
 
-      console.error('ChatService error:', error);
-      
-      if (error?.status === 429) {
-        throw new ServiceUnavailableException('La IA está saturada, intenta luego');
-      }
-      
-      throw new InternalServerErrorException('Error interno del servidor');
+      return '';
+
+    } catch (error) {
+      return 'Error: ' + error.message;
     }
   }
 }
